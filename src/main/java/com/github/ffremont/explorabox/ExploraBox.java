@@ -5,13 +5,28 @@
  */
 package com.github.ffremont.explorabox;
 
-import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
-import java.net.InterfaceAddress;
-import java.net.NetworkInterface;
-import java.util.Enumeration;
+import com.github.ffremont.explorabox.exceptions.InitializeWatcherServiceFailException;
+import com.github.ffremont.explorabox.exceptions.InstallationFailException;
+import com.github.ffremont.explorabox.models.DataFolder;
+import com.github.ffremont.explorabox.models.SyncState;
+import com.github.ffremont.explorabox.runs.SyncCron;
+import com.github.ffremont.explorabox.services.DiscoverService;
+import com.github.ffremont.explorabox.services.RecursiveWatcherService;
+import com.github.ffremont.explorabox.services.TrayService;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import org.slf4j.LoggerFactory;
 
 /**
  *
@@ -19,76 +34,59 @@ import java.util.Enumeration;
  */
 public class ExploraBox {
 
-    public static void main(String[] args) {
-        Thread discoveryThread = new Thread(DiscoveryThread.getInstance());  
-        discoveryThread.start(); 
-        
-        // Find the server using UDP broadcast
+    private static final org.slf4j.Logger LOG = LoggerFactory.getLogger(ExploraBox.class);
+
+    private final static int syncEvery = 60;
+
+    public static final String DEFAULT_SYNC_FOLDER = "explorabox";
+
+    public static TrayService trayService;
+    public static Map<Path, RecursiveWatcherService> watcherServices = new HashMap<>();
+    public static DiscoverService discoverService;
+
+    public static ExecutorService synchronisationPool = Executors.newFixedThreadPool(10);
+    public static ConcurrentHashMap<Path, Synchronisation> synchronisations = new ConcurrentHashMap<>();
+
+    public static ExecutorService writesPool = Executors.newFixedThreadPool(5);
+    public static ExecutorService exploraPool = Executors.newFixedThreadPool(3);
+
+    private static Path confFolder;
+
+    public static void main(String[] args) throws InterruptedException {
+        final int exploraPort = System.getProperty("explora.port") == null ? 8888 : Integer.valueOf(System.getProperty("explora.port"));
+        final int discoveryPort = System.getProperty("discovery.port") == null ? 8889 : Integer.valueOf(System.getProperty("discovery.port"));
+
+        String lineSeparator = System.getProperty("line.separator");
+        InputStream inputStream = Thread.currentThread().getContextClassLoader().getResourceAsStream("header.txt");
+        try (Scanner scanner = new Scanner(inputStream, StandardCharsets.UTF_8.name())) {
+            System.out.print(scanner.useDelimiter("\\A").next());
+            System.out.println(lineSeparator+lineSeparator);
+        }
+
+        trayService = new TrayService("ExploraBox", "Démarrage en cours...");
+        trayService.start();
+
+        confFolder = Paths.get(System.getProperty("user.home"), ".explorabox");
+
         try {
-            //Open a random port to send the package
-            DatagramSocket c = new DatagramSocket();
-            c.setBroadcast(true);
-            c.setSoTimeout(3000);
-
-            byte[] sendData = "DISCOVER_FUIFSERVER_REQUEST".getBytes();
-
-            //Try the 255.255.255.255 first
-            try {
-                DatagramPacket sendPacket = new DatagramPacket(sendData, sendData.length, InetAddress.getByName("255.255.255.255"), 8888);
-                c.send(sendPacket);
-                System.out.println(ExploraBox.class + ">>> Request packet sent to: 255.255.255.255 (DEFAULT)");
-            } catch (Exception e) {
-            }
-
-            // Broadcast the message over all the network interfaces
-            Enumeration interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces.hasMoreElements()) {
-                NetworkInterface networkInterface = (NetworkInterface) interfaces.nextElement();
-
-                if (networkInterface.isLoopback() || !networkInterface.isUp()) {
-                    continue; // Don't want to broadcast to the loopback interface
+            if (args.length > 0) {
+                if ("install".equals(args[0])) {
+                    (new Installation(confFolder)).make();
+                } else {
+                    LOG.error("Aucune commande de ce nom existe, veuillez ressayer avec la bonne commande.");
+                }
+            } else {
+                ExploraAccount account = ExploraConf.getAccount(confFolder);
+                for (DataFolder dataFolder : account.getFolders()) {
+                    synchronisations.put(dataFolder.getSource(), new Synchronisation(dataFolder.getSource(), dataFolder.getFolderTargetName()));
                 }
 
-                for (InterfaceAddress interfaceAddress : networkInterface.getInterfaceAddresses()) {
-                    InetAddress broadcast = interfaceAddress.getBroadcast();
-                    if (broadcast == null) {
-                        continue;
-                    }
-
-                    // Send the broadcast package!
-                    try {
-                        DatagramPacket sendPacket = new DatagramPacket(sendData, sendData.length, broadcast, 8888);
-                        c.send(sendPacket);
-                    } catch (Exception e) {
-                    }
-
-                    System.out.println(ExploraBox.class + ">>> Request packet sent to: " + broadcast.getHostAddress() + "; Interface: " + networkInterface.getDisplayName());
-                }
+                SyncCron.setExploraPort(exploraPort);
+                discoverService = new DiscoverService("explora", discoveryPort, "explora ?", "oui");
+                Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(new SyncCron(account, discoverService), 0, syncEvery, TimeUnit.SECONDS);
             }
-
-            System.out.println(ExploraBox.class + ">>> Done looping over all network interfaces. Now waiting for a reply!");
-
-            //Wait for a response
-            byte[] recvBuf = new byte[15000];
-            DatagramPacket receivePacket = new DatagramPacket(recvBuf, recvBuf.length);
-            c.receive(receivePacket);
-
-            //We have a response
-            System.out.println(ExploraBox.class + ">>> Broadcast response from server: " + receivePacket.getAddress().getHostAddress());
-
-            //Check if the message is correct
-            String message = new String(receivePacket.getData()).trim();
-            if (message.equals("DISCOVER_FUIFSERVER_RESPONSE")) {
-                //DO SOMETHING WITH THE SERVER'S IP (for example, store it in your controller)
-                //Controller_Base.setServerIp(receivePacket.getAddress());
-            }
-
-            //Close the port!
-            c.close();
-        } catch (IOException ex) {
-            ex.printStackTrace();
-            System.err.println(ex.getMessage());
-            //Logger.getLogger(LoginWindow.class.getName()).log(Level.SEVERE, null, ex);
+        } catch (InstallationFailException ex) {
+            LOG.error("Echec de l'installation", ex);
         }
     }
 
